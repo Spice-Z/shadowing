@@ -1,7 +1,9 @@
-soundfile
+librosa>=0.10.0
+parselmouth
 numpy
-librosa
 scipy
 fastdtw
 pydub
-matplotlib 
+matplotlib
+soundfile
+praat-parselmouth

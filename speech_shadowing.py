@@ -7,11 +7,20 @@ from pathlib import Path
 from pydub import AudioSegment
 import librosa.display
 import matplotlib.pyplot as plt
+import parselmouth  # For detailed pitch analysis
+from parselmouth.praat import call  # For formant analysis
+import scipy.stats
+from typing import Dict, List, Tuple
 
 class ShadowingPractice:
     def __init__(self):
         self.output_dir = Path("recordings")
         self.output_dir.mkdir(exist_ok=True)
+        self.pronunciation_weights = {
+            'formants': 0.4,
+            'spectral': 0.3,
+            'mfcc': 0.3
+        }
         
     def convert_to_wav(self, audio_path):
         """Convert audio file to WAV format if needed"""
@@ -65,140 +74,241 @@ class ShadowingPractice:
             'energy': librosa.feature.rms(y=audio, hop_length=512)[0],
             'spectral_centroid': librosa.feature.spectral_centroid(y=audio, sr=sr)[0],
             'onset_frames': librosa.onset.onset_detect(y=audio, sr=sr, units='frames'),
-            'tempo': librosa.beat.tempo(y=audio, sr=sr)[0]
+            'tempo': librosa.feature.tempo(y=audio, sr=sr)[0],
+            'rhythm': librosa.feature.tempogram(y=audio, sr=sr),
+            'chroma': librosa.feature.chroma_stft(y=audio, sr=sr),
+            'formants': self._extract_formants(audio, sr),
+            'zero_crossing_rate': librosa.feature.zero_crossing_rate(audio)[0]
         }
         return features
 
+    def _extract_formants(self, audio, sr):
+        """Extract formants using Praat"""
+        # Ensure audio is a 1D array
+        if audio.ndim > 1:
+            audio = audio.flatten()
+        
+        # Replace NaN values with zeros and convert to float64
+        audio = np.nan_to_num(audio).astype(np.float64)
+        
+        # Convert audio to Praat Sound object
+        sound = parselmouth.Sound(audio, sampling_frequency=float(sr))
+        formant = call(sound, "To Formant (burg)", 0.0025, 5, 5500, 0.025, 50)
+        
+        # Extract first 3 formants
+        formants = []
+        for i in range(1, 4):
+            formant_values = [call(formant, "Get value at time", i, t, 'Hertz', 'Linear') 
+                            for t in np.arange(0, sound.duration, 0.01)]
+            formants.append(np.array(formant_values))
+        
+        return np.array(formants)
+
     def analyze_detailed_differences(self, target_features, recorded_features, dtw_path, sr):
         """Provide detailed analysis of differences"""
-        feedback = []
+        feedback = {
+            'pronunciation': self.analyze_pronunciation(target_features, recorded_features, sr),
+            'rhythm': self.analyze_rhythm(target_features, recorded_features, sr),
+            'sound_strength': self.analyze_sound_strength(target_features, recorded_features, sr),
+            'intonation': self.analyze_intonation(target_features, recorded_features, sr)
+        }
         
-        # Analyze timing
-        target_tempo = target_features['tempo']
-        recorded_tempo = recorded_features['tempo']
-        tempo_diff = abs(target_tempo - recorded_tempo)
-        if tempo_diff > 10:
-            feedback.append(f"Speaking speed differs by {tempo_diff:.1f} BPM "
-                          f"({'faster' if recorded_tempo > target_tempo else 'slower'} than target)")
+        return feedback
 
-        # Analyze pitch patterns
+    def analyze_pronunciation(self, target_features, recorded_features, sr) -> Dict:
+        """Detailed pronunciation analysis"""
+        feedback = {
+            'score': 0,
+            'details': [],
+            'segments': []
+        }
+        
+        # Analyze formants
+        formant_score, formant_feedback = self._compare_formants(
+            target_features['formants'],
+            recorded_features['formants']
+        )
+        
+        # Analyze spectral characteristics
+        spectral_score, spectral_feedback = self._compare_spectral(
+            target_features['spectral_centroid'],
+            recorded_features['spectral_centroid'],
+            target_features['zero_crossing_rate'],
+            recorded_features['zero_crossing_rate']
+        )
+        
+        # Analyze MFCC for overall pronunciation
+        mfcc_score, mfcc_feedback = self._compare_mfcc(
+            target_features['mfcc'],
+            recorded_features['mfcc']
+        )
+        
+        # Calculate weighted score
+        feedback['score'] = (
+            formant_score * self.pronunciation_weights['formants'] +
+            spectral_score * self.pronunciation_weights['spectral'] +
+            mfcc_score * self.pronunciation_weights['mfcc']
+        )
+        
+        feedback['details'].extend(formant_feedback + spectral_feedback + mfcc_feedback)
+        
+        return feedback
+
+    def analyze_rhythm(self, target_features, recorded_features, sr) -> Dict:
+        """Detailed rhythm analysis"""
+        feedback = {
+            'score': 0,
+            'details': [],
+            'segments': []
+        }
+        
+        # Compare onset patterns
+        target_onsets = librosa.frames_to_time(target_features['onset_frames'], sr=sr)
+        recorded_onsets = librosa.frames_to_time(recorded_features['onset_frames'], sr=sr)
+        
+        # Calculate inter-onset intervals
+        target_ioi = np.diff(target_onsets)
+        recorded_ioi = np.diff(recorded_onsets)
+        
+        # Compare rhythm patterns using tempogram
+        # Ensure both tempograms have the same size
+        target_rhythm = target_features['rhythm']
+        recorded_rhythm = recorded_features['rhythm']
+        
+        # Get minimum size along each dimension
+        min_rows = min(target_rhythm.shape[0], recorded_rhythm.shape[0])
+        min_cols = min(target_rhythm.shape[1], recorded_rhythm.shape[1])
+        
+        # Truncate both arrays to the same size
+        target_rhythm = target_rhythm[:min_rows, :min_cols]
+        recorded_rhythm = recorded_rhythm[:min_rows, :min_cols]
+        
+        # Calculate correlation
+        rhythm_correlation = np.corrcoef(
+            target_rhythm.flatten(),
+            recorded_rhythm.flatten()
+        )[0, 1]
+        
+        # Calculate rhythm score
+        rhythm_score = (rhythm_correlation + 1) / 2 * 100
+        feedback['score'] = rhythm_score
+        
+        # Generate detailed feedback
+        if rhythm_score < 70:
+            feedback['details'].append("Significant rhythm differences detected")
+            
+            # Analyze specific rhythm patterns
+            if len(target_ioi) > len(recorded_ioi):
+                feedback['details'].append("Missing syllables or words detected")
+            elif len(target_ioi) < len(recorded_ioi):
+                feedback['details'].append("Extra syllables or words detected")
+                
+            # Compare rhythm stability
+            target_stability = np.std(target_ioi)
+            recorded_stability = np.std(recorded_ioi)
+            if recorded_stability > target_stability * 1.2:
+                feedback['details'].append("Rhythm is unstable - try to maintain more consistent timing")
+        
+        return feedback
+
+    def analyze_sound_strength(self, target_features, recorded_features, sr) -> Dict:
+        """Detailed sound strength/volume analysis"""
+        feedback = {
+            'score': 0,
+            'details': [],
+            'segments': []
+        }
+        
+        # Normalize energy features
+        target_energy = target_features['energy'] / np.max(target_features['energy'])
+        recorded_energy = recorded_features['energy'] / np.max(recorded_features['energy'])
+        
+        # Ensure both arrays have the same length
+        min_length = min(len(target_energy), len(recorded_energy))
+        target_energy = target_energy[:min_length]
+        recorded_energy = recorded_energy[:min_length]
+        
+        # Calculate dynamic range
+        target_dynamic_range = np.ptp(target_energy)
+        recorded_dynamic_range = np.ptp(recorded_energy)
+        
+        # Compare energy patterns
+        energy_correlation = np.corrcoef(target_energy, recorded_energy)[0, 1]
+        energy_score = (energy_correlation + 1) / 2 * 100
+        
+        feedback['score'] = energy_score
+        
+        # Analyze dynamic range differences
+        if abs(target_dynamic_range - recorded_dynamic_range) > 0.2:
+            if recorded_dynamic_range < target_dynamic_range:
+                feedback['details'].append(
+                    "Dynamic range is too narrow - try to vary your volume more between loud and soft parts"
+                )
+            else:
+                feedback['details'].append(
+                    "Dynamic range is too wide - try to control volume variations"
+                )
+        
+        # Find specific segments with volume mismatches
+        segments = self._find_volume_segments(target_energy, recorded_energy, sr)
+        feedback['segments'] = segments
+        
+        return feedback
+
+    def analyze_intonation(self, target_features, recorded_features, sr) -> Dict:
+        """Detailed intonation analysis"""
+        feedback = {
+            'score': 0,
+            'details': [],
+            'segments': []
+        }
+        
+        # Extract pitch contours and ensure they're the same length
         target_pitch = target_features['pitch']
         recorded_pitch = recorded_features['pitch']
         
-        # Find segments with significant pitch differences
-        pitch_segments = self.find_pitch_differences(target_pitch, recorded_pitch, sr)
-        if pitch_segments:
-            feedback.extend(pitch_segments)
-
-        # Analyze energy/volume patterns
-        target_energy = target_features['energy']
-        recorded_energy = recorded_features['energy']
-        energy_segments = self.find_energy_differences(target_energy, recorded_energy, sr)
-        if energy_segments:
-            feedback.extend(energy_segments)
-
-        # Analyze pronunciation clarity
-        spectral_diff = self.analyze_spectral_differences(
-            target_features['spectral_centroid'],
-            recorded_features['spectral_centroid'],
-            sr
-        )
-        if spectral_diff:
-            feedback.extend(spectral_diff)
-
-        return feedback
-
-    def find_pitch_differences(self, target_pitch, recorded_pitch, sr):
-        """Identify segments with significant pitch differences"""
-        feedback = []
-        min_segment_length = int(0.2 * sr)  # 200ms minimum segment
+        # Get minimum length and truncate both arrays
+        min_length = min(len(target_pitch), len(recorded_pitch))
+        target_pitch = target_pitch[:min_length]
+        recorded_pitch = recorded_pitch[:min_length]
         
-        # Normalize and compare pitch contours
+        # Replace any NaN values with 0
         target_pitch = np.nan_to_num(target_pitch)
         recorded_pitch = np.nan_to_num(recorded_pitch)
         
-        # Interpolate to make both arrays the same length
-        target_len = len(target_pitch)
-        recorded_len = len(recorded_pitch)
-        max_len = max(target_len, recorded_len)
+        # Calculate pitch statistics
+        target_stats = self._calculate_pitch_statistics(target_pitch)
+        recorded_stats = self._calculate_pitch_statistics(recorded_pitch)
         
-        # Create evenly spaced points for interpolation
-        x_target = np.linspace(0, 1, target_len)
-        x_recorded = np.linspace(0, 1, recorded_len)
-        x_new = np.linspace(0, 1, max_len)
+        # Compare pitch ranges
+        pitch_range_diff = abs(target_stats['range'] - recorded_stats['range'])
+        if pitch_range_diff > 20:
+            feedback['details'].append(
+                f"Pitch range differs by {pitch_range_diff:.1f} Hz - "
+                f"{'wider' if recorded_stats['range'] > target_stats['range'] else 'narrower'} than target"
+            )
         
-        # Interpolate both signals to the same length
-        target_interpolated = np.interp(x_new, x_target, target_pitch)
-        recorded_interpolated = np.interp(x_new, x_recorded, recorded_pitch)
+        # Compare pitch patterns
+        pitch_correlation = np.corrcoef(target_pitch, recorded_pitch)[0, 1]
         
-        # Find segments where pitch differs significantly
-        diff_threshold = 50  # Hz
-        significant_diffs = np.where(abs(target_interpolated - recorded_interpolated) > diff_threshold)[0]
+        intonation_score = (pitch_correlation + 1) / 2 * 100
+        feedback['score'] = intonation_score
         
-        if len(significant_diffs) > 0:
-            segments = self.group_consecutive_frames(significant_diffs)
-            for start, end in segments:
-                if (end - start) >= min_segment_length:
-                    # Convert frame index to time
-                    time_start = start * len(target_pitch) / max_len / sr
-                    feedback.append(f"Pitch difference detected at {time_start:.2f}s - "
-                                  f"Try matching the target intonation pattern")
+        # Find specific segments with intonation mismatches
+        segments = self._find_intonation_segments(target_pitch, recorded_pitch, sr)
+        feedback['segments'] = segments
         
         return feedback
 
-    def find_energy_differences(self, target_energy, recorded_energy, sr):
-        """Identify segments with significant energy/volume differences"""
-        feedback = []
-        
-        # Normalize energies
-        target_energy = target_energy / np.max(target_energy)
-        recorded_energy = recorded_energy / np.max(recorded_energy)
-        
-        # Interpolate to make both arrays the same length
-        target_len = len(target_energy)
-        recorded_len = len(recorded_energy)
-        max_len = max(target_len, recorded_len)
-        
-        # Create evenly spaced points for interpolation
-        x_target = np.linspace(0, 1, target_len)
-        x_recorded = np.linspace(0, 1, recorded_len)
-        x_new = np.linspace(0, 1, max_len)
-        
-        # Interpolate both signals to the same length
-        target_interpolated = np.interp(x_new, x_target, target_energy)
-        recorded_interpolated = np.interp(x_new, x_recorded, recorded_energy)
-        
-        # Find segments where energy differs significantly
-        diff_threshold = 0.3
-        significant_diffs = np.where(abs(target_interpolated - recorded_interpolated) > diff_threshold)[0]
-        
-        if len(significant_diffs) > 0:
-            segments = self.group_consecutive_frames(significant_diffs)
-            for start, end in segments:
-                time_start = librosa.frames_to_time(start, sr=sr, hop_length=512)
-                feedback.append(f"Volume mismatch at {time_start:.2f}s - "
-                              f"{'Speak louder' if recorded_interpolated[start] < target_interpolated[start] else 'Speak softer'}")
-        
-        return feedback
-
-    def analyze_spectral_differences(self, target_centroid, recorded_centroid, sr):
-        """Analyze differences in pronunciation clarity using spectral centroid"""
-        feedback = []
-        
-        # Compare average spectral centroids
-        target_mean = np.mean(target_centroid)
-        recorded_mean = np.mean(recorded_centroid)
-        
-        diff_ratio = abs(target_mean - recorded_mean) / target_mean
-        if diff_ratio > 0.2:
-            if recorded_mean < target_mean:
-                feedback.append("Overall pronunciation could be clearer - "
-                              "try to articulate sounds more distinctly")
-            else:
-                feedback.append("Pronunciation is over-emphasized - "
-                              "try to speak more naturally")
-        
-        return feedback
+    def _calculate_pitch_statistics(self, pitch):
+        """Calculate various statistics for pitch analysis"""
+        valid_pitch = pitch[pitch > 0]
+        return {
+            'mean': np.mean(valid_pitch),
+            'std': np.std(valid_pitch),
+            'range': np.ptp(valid_pitch),
+            'median': np.median(valid_pitch)
+        }
 
     @staticmethod
     def group_consecutive_frames(frames):
@@ -219,6 +329,170 @@ class ShadowingPractice:
         groups.append((start, prev))
         return groups
 
+    def _compare_formants(self, target_formants, recorded_formants):
+        """Compare formants between target and recorded audio"""
+        # Ensure both arrays have the same length
+        min_length = min(len(target_formants[0]), len(recorded_formants[0]))
+        
+        # Calculate correlation for each formant
+        correlations = []
+        for i in range(3):  # First 3 formants
+            target_f = target_formants[i][:min_length]
+            recorded_f = recorded_formants[i][:min_length]
+            # Handle edge cases
+            if np.all(target_f == target_f[0]) or np.all(recorded_f == recorded_f[0]):
+                correlation = 0.0
+            else:
+                try:
+                    correlation = np.corrcoef(target_f, recorded_f)[0, 1]
+                    if np.isnan(correlation):
+                        correlation = 0.0
+                except:
+                    correlation = 0.0
+            correlations.append(correlation)
+        
+        # Calculate overall score
+        score = max(0, min(100, np.mean(correlations) * 100))
+        
+        # Generate feedback
+        feedback = []
+        if score < 70:
+            feedback.append("Significant differences in vowel pronunciation detected")
+            
+        return score, feedback
+
+    def _compare_spectral(self, target_centroid, recorded_centroid, target_zcr, recorded_zcr):
+        """Compare spectral characteristics between target and recorded audio"""
+        # Ensure arrays have same length
+        min_length = min(len(target_centroid), len(recorded_centroid))
+        target_centroid = target_centroid[:min_length]
+        recorded_centroid = recorded_centroid[:min_length]
+        target_zcr = target_zcr[:min_length]
+        recorded_zcr = recorded_zcr[:min_length]
+        
+        # Calculate correlations with error handling
+        try:
+            centroid_correlation = np.corrcoef(target_centroid, recorded_centroid)[0, 1]
+            if np.isnan(centroid_correlation):
+                centroid_correlation = 0.0
+        except:
+            centroid_correlation = 0.0
+            
+        try:
+            zcr_correlation = np.corrcoef(target_zcr, recorded_zcr)[0, 1]
+            if np.isnan(zcr_correlation):
+                zcr_correlation = 0.0
+        except:
+            zcr_correlation = 0.0
+        
+        # Calculate overall spectral score
+        score = max(0, min(100, ((centroid_correlation + zcr_correlation) / 2) * 100))
+        
+        # Generate feedback
+        feedback = []
+        if score < 70:
+            if centroid_correlation < 0.7:
+                feedback.append("Significant differences in sound brightness/timbre detected")
+            if zcr_correlation < 0.7:
+                feedback.append("Differences in consonant pronunciation detected")
+                
+        return score, feedback
+
+    def _compare_mfcc(self, target_mfcc, recorded_mfcc):
+        """Compare MFCC features between target and recorded audio"""
+        # Ensure both MFCCs have same length
+        min_length = min(target_mfcc.shape[1], recorded_mfcc.shape[1])
+        target_mfcc = target_mfcc[:, :min_length]
+        recorded_mfcc = recorded_mfcc[:, :min_length]
+        
+        # Calculate correlation for each MFCC coefficient
+        correlations = []
+        for i in range(min(target_mfcc.shape[0], recorded_mfcc.shape[0])):
+            try:
+                correlation = np.corrcoef(target_mfcc[i], recorded_mfcc[i])[0, 1]
+                if np.isnan(correlation):
+                    correlation = 0.0
+            except:
+                correlation = 0.0
+            correlations.append(correlation)
+        
+        # Calculate overall score
+        score = max(0, min(100, np.mean(correlations) * 100))
+        
+        # Generate feedback
+        feedback = []
+        if score < 70:
+            feedback.append("Overall pronunciation patterns show significant differences")
+            
+        return score, feedback
+
+    def _find_volume_segments(self, target_energy, recorded_energy, sr):
+        """Find segments with significant volume differences"""
+        segments = []
+        
+        # Calculate the difference in energy
+        energy_diff = np.abs(target_energy - recorded_energy)
+        
+        # Find segments where the difference is significant (threshold can be adjusted)
+        threshold = np.mean(energy_diff) + np.std(energy_diff)
+        significant_diffs = np.where(energy_diff > threshold)[0]
+        
+        # Group consecutive frames into segments
+        if len(significant_diffs) > 0:
+            groups = self.group_consecutive_frames(significant_diffs)
+            
+            # Convert frame indices to time segments
+            hop_length = 512  # This should match the hop_length used in RMS calculation
+            for start_frame, end_frame in groups:
+                start_time = librosa.frames_to_time(start_frame, sr=sr, hop_length=hop_length)
+                end_time = librosa.frames_to_time(end_frame, sr=sr, hop_length=hop_length)
+                
+                # Add segment description
+                avg_diff = np.mean(energy_diff[start_frame:end_frame])
+                if target_energy[start_frame] > recorded_energy[start_frame]:
+                    direction = "too quiet"
+                else:
+                    direction = "too loud"
+                    
+                segments.append(
+                    f"Time {start_time:.2f}s - {end_time:.2f}s: {direction}"
+                )
+        
+        return segments
+
+    def _find_intonation_segments(self, target_pitch, recorded_pitch, sr):
+        """Find segments with significant intonation differences"""
+        segments = []
+        
+        # Calculate the difference in pitch
+        pitch_diff = np.abs(target_pitch - recorded_pitch)
+        
+        # Find segments where the difference is significant
+        threshold = np.mean(pitch_diff) + np.std(pitch_diff)
+        significant_diffs = np.where(pitch_diff > threshold)[0]
+        
+        # Group consecutive frames into segments
+        if len(significant_diffs) > 0:
+            groups = self.group_consecutive_frames(significant_diffs)
+            
+            # Convert frame indices to time segments
+            hop_length = 512  # This should match the hop_length used in feature extraction
+            for start_frame, end_frame in groups:
+                start_time = librosa.frames_to_time(start_frame, sr=sr, hop_length=hop_length)
+                end_time = librosa.frames_to_time(end_frame, sr=sr, hop_length=hop_length)
+                
+                # Determine if pitch is too high or too low
+                if target_pitch[start_frame] > recorded_pitch[start_frame]:
+                    direction = "too low"
+                else:
+                    direction = "too high"
+                    
+                segments.append(
+                    f"Time {start_time:.2f}s - {end_time:.2f}s: pitch is {direction}"
+                )
+        
+        return segments
+
 def main():
     practice = ShadowingPractice()
     
@@ -230,7 +504,7 @@ def main():
     
     # Use a local audio file for the user's shadowing attempt
     # recorded_file = Path("user_audio.wav")
-    recorded_file = Path("user_audio.wav")
+    recorded_file = Path("user_audioaaa.wav")
     if not recorded_file.exists():
         print(f"Error: User audio file not found at {recorded_file}")
         return
@@ -238,13 +512,24 @@ def main():
     # Compare audio and get score
     score, feedback = practice.compare_audio(target_file, recorded_file)
     
-    # Display results
+    # Display detailed results
     print(f"\nOverall Score: {score:.2f}/100")
     
     if feedback:
-        print("\nAreas for Improvement:")
-        for area in feedback:
-            print(f"- {area}")
+        print("\nDetailed Feedback:")
+        
+        for category, results in feedback.items():
+            print(f"\n{category.upper()} Score: {results['score']:.2f}/100")
+            
+            if results['details']:
+                print("Details:")
+                for detail in results['details']:
+                    print(f"- {detail}")
+            
+            if results['segments']:
+                print("Specific segments to improve:")
+                for segment in results['segments']:
+                    print(f"- {segment}")
     else:
         print("\nGreat job! Your pronunciation is very close to the target.")
         
