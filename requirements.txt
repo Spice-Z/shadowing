@@ -1,0 +1,7 @@
+soundfile
+numpy
+librosa
+scipy
+fastdtw
+pydub
+matplotlib 
